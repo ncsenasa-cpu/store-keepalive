@@ -1,0 +1,31 @@
+name: keepalive
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ping main + backup domains
+        run: |
+          set -uo pipefail
+          fail=0
+          for url in \
+            "https://lantueshop.com/" \
+            "https://lantueshop.com/api/health/live" \
+            "https://crossborder-store-15498.app.workbuddy.host/" \
+            "https://crossborder-store-15498.app.workbuddy.host/api/health/live"; do
+            out=$(curl -s -o /dev/null -m 60 -w '%{http_code} %{time_total}s' "$url" || echo "000 timeout")
+            code=${out%% *}
+            echo "$url -> $out"
+            if [ "$code" != "200" ]; then
+              echo "::error::$url 返回 $code"
+              fail=1
+            fi
+          done
+          if [ "$fail" = "1" ]; then exit 1; fi
+          echo "全部 200，站点处于热的保活状态"
