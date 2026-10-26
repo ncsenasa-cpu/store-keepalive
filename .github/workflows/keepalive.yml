@@ -19,11 +19,17 @@ jobs:
             "https://lantueshop.com/api/health/live" \
             "https://crossborder-store-15498.app.workbuddy.host/" \
             "https://crossborder-store-15498.app.workbuddy.host/api/health/live"; do
-            out=$(curl -s -o /dev/null -m 60 -w '%{http_code} %{time_total}s' "$url" || echo "000 timeout")
-            code=${out%% *}
-            echo "$url -> $out"
+            code="000"; i=0
+            while [ "$i" -lt 2 ]; do
+              i=$((i+1))
+              out=$(curl -s -o /dev/null -m 60 -w '%{http_code} %{time_total}s' "$url" || echo "000 timeout")
+              code=${out%% *}
+              echo "[try $i] $url -> $out"
+              if [ "$code" = "200" ]; then break; fi
+              sleep 5
+            done
             if [ "$code" != "200" ]; then
-              echo "::error::$url 返回 $code"
+              echo "::error::$url 返回 $code（冷启动窗口内或服务异常）"
               fail=1
             fi
           done
