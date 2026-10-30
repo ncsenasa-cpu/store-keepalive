@@ -1,37 +1,98 @@
 name: keepalive
 
+# 跨境电商独立站保活：从平台外 ping 生产域名，防止 WorkBuddy 沙箱空闲休眠。
+#
+# 【重要事实 · 2026-10-30 实测】
+# GitHub 对 `*/5` 的高频 cron 会主动降频：本仓库 215 次运行的实际间隔是
+# 最小 36 分钟 / 中位 47 分钟 / 最大 69 分钟，**并不是 5 分钟**。
+# 也就是说这层的实际粒度≈每小时，与平台内每小时巡检基本重合，
+# 它的价值只剩「GitHub 云端独立视角的可用性旁证」，保活边际作用有限。
+# 真正 1 分钟粒度的保活请看同目录 README 的「Cloudflare Worker Cron」方案。
+#
+# 【2026-10-30 修改：消除误报邮件】
+# 旧逻辑：任一 URL 非 200 → 整个 job 失败 → GitHub 发失败邮件。
+# 问题：沙箱冷启动偶发 >60s（第 212 次运行 23:15Z 就是这种情况，
+#       耗时 2m29s 后判失败，而下一次运行立刻 200），属噪声。
+# 新逻辑：
+#   1. 每次尝试的超时放宽到 90s（吸收冷启动），每个域名最多 2 次；
+#   2. 只有【两个域名同时挂】才 exit 1（那才是真故障）；
+#   3. 单域名异常只打 ::warning::，Actions 仍显示绿勾，不再发失败邮件。
+# 判别真故障交给平台内每小时巡检（有邮件告警）承担，职责不重叠。
+
 on:
   schedule:
-    - cron: "*/5 * * * *"
-  workflow_dispatch: {}
+    - cron: "*/5 * * * *"   # 会被 GitHub 降频到 ~40–70 分钟，见上方说明
+  workflow_dispatch: {}      # Actions 页面可手动触发，便于验证
 
 jobs:
   ping:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - name: Ping main + backup domains
         run: |
           set -uo pipefail
-          fail=0
-          for url in \
-            "https://lantueshop.com/" \
-            "https://lantueshop.com/api/health/live" \
-            "https://crossborder-store-15498.app.workbuddy.host/" \
-            "https://crossborder-store-15498.app.workbuddy.host/api/health/live"; do
-            code="000"; i=0
-            while [ "$i" -lt 2 ]; do
+
+          ATTEMPTS=2       # 每个域名的尝试次数
+          TIMEOUT=90       # 单次 curl 超时（秒），冷启动唤醒可能 30–90s
+          GAP=10           # 两次尝试之间的间隔（秒）
+
+          # 探测单个 URL，只回显 "code 耗时"
+          # 注意：curl 超时/连不上时也会打印 -w 格式（形如 "000 60.01s"），
+          # 所以不能用 `|| echo 000` 兜底，会拼出 "000 60.01s000 error" 这种脏串。
+          probe() {
+            local out
+            out=$(curl -s -o /dev/null -m "$2" -w '%{http_code} %{time_total}s' "$1" 2>/dev/null)
+            printf '%s' "$out" | grep -qE '^[0-9]{3} ' || out="000 n/a"
+            printf '%s' "$out"
+          }
+
+          # 探测一个域名：先探首页（唤醒），首页 200 后再探健康接口
+          # 返回 0 = 该域名存活；返回 1 = 该域名不可用
+          check_domain() {
+            local base="$1" label="$2" code="000" out="000" i=0
+            while [ "$i" -lt "$ATTEMPTS" ]; do
               i=$((i+1))
-              out=$(curl -s -o /dev/null -m 60 -w '%{http_code} %{time_total}s' "$url" || echo "000 timeout")
+              out=$(probe "$base/" "$TIMEOUT")
               code=${out%% *}
-              echo "[try $i] $url -> $out"
+              echo "[$label] 首页 try $i/$ATTEMPTS -> $out"
               if [ "$code" = "200" ]; then break; fi
-              sleep 5
+              if [ "$i" -lt "$ATTEMPTS" ]; then sleep "$GAP"; fi
             done
             if [ "$code" != "200" ]; then
-              echo "::error::$url 返回 $code（冷启动窗口内或服务异常）"
-              fail=1
+              echo "::warning::$label 首页 $ATTEMPTS 次均未返回 200（最后结果：$out）"
+              return 1
             fi
-          done
-          if [ "$fail" = "1" ]; then exit 1; fi
-          echo "全部 200，站点处于热的保活状态"
+
+            out=$(probe "$base/api/health/live" 30)
+            echo "[$label] /api/health/live -> $out"
+            if [ "${out%% *}" != "200" ]; then
+              echo "::warning::$label 健康接口返回 ${out%% *}（首页正常，仅记录，不判失败）"
+            fi
+            return 0
+          }
+
+          live=0
+          check_domain "https://lantueshop.com" "主域名 lantueshop.com" && live=$((live+1))
+          check_domain "https://crossborder-store-15498.app.workbuddy.host" "源站 app.workbuddy.host" && live=$((live+1))
+
+          echo ""
+          echo "存活域名：$live / 2"
+
+          {
+            echo "### 保活探测结果"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 存活域名 | $live / 2 |"
+            echo "| 时间(UTC) | $(date -u '+%Y-%m-%d %H:%M:%S') |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$live" = "0" ]; then
+            echo "::error::两个域名全部不可用，判定为真实故障（请查沙箱状态 / 部署 / DNS）"
+            exit 1
+          elif [ "$live" = "1" ]; then
+            echo "::warning::只有一个域名可用，另一个异常；站点整体仍可访问，不判失败（避免误报邮件）"
+          else
+            echo "全部存活，站点处于热的保活状态"
+          fi
